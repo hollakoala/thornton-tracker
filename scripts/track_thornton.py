@@ -76,13 +76,38 @@ def scrape_units():
     })()
     """
 
+    debug_dir = ROOT / "data" / "debug"
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--use-gl=swiftshader",  # software WebGL - the SightMap widget needs a GL context
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                ],
+            )
+            page = browser.new_page(
+                viewport={"width": 1440, "height": 900},
+                user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                             "AppleWebKit/537.36 (KHTML, like Gecko) "
+                             "Chrome/125.0.0.0 Safari/537.36"),
+            )
+            # Hide the most common automation fingerprint
+            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
             page.goto(SITE_URL, wait_until="networkidle", timeout=45000)
-            page.wait_for_timeout(2500)
+            page.wait_for_timeout(3500)
             units = page.evaluate(js)
+
+            if not units:
+                # Leave evidence behind so a human (or Claude) can see what actually rendered
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                page.screenshot(path=str(debug_dir / "last_failure.png"), full_page=True)
+                (debug_dir / "last_failure.html").write_text(page.content())
+                print("::warning::Zero units extracted - saved data/debug/last_failure.png "
+                      "and last_failure.html for inspection.")
+
             browser.close()
     except Exception as e:
         print(f"::warning::Scrape failed: {e}")
@@ -278,11 +303,11 @@ def build_html(report, as_of):
             f'<span class="unit">#{unit}</span></div>'
             f'<div class="change flat">no change</div></div></div>'
         )
-    EM_DASH = "\u2014"
+
     archive_html = "".join(
         f'<div class="archive-row"><span>#{unit}</span>'
-        f'<span class="p">{f"${price:,.0f}" if price else EM_DASH}</span></div>'
-      for unit, price in report["off_market"]
+        f'<span class="p">{f"${price:,.0f}" if price else "\u2014"}</span></div>'
+        for unit, price in report["off_market"]
     )
 
     css = """:root{--cream:#f6f3ea;--ink:#22281f;--moss-dim:#7c8f7a;--line:#dcd6c4;
