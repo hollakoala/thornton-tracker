@@ -278,11 +278,11 @@ def build_html(report, as_of):
             f'<span class="unit">#{unit}</span></div>'
             f'<div class="change flat">no change</div></div></div>'
         )
-
+    EM_DASH = "\u2014"
     archive_html = "".join(
         f'<div class="archive-row"><span>#{unit}</span>'
-        f'<span class="p">{f"${price:,.0f}" if price else "\u2014"}</span></div>'
-        for unit, price in report["off_market"]
+        f'<span class="p">{f"${price:,.0f}" if price else EM_DASH}</span></div>'
+      for unit, price in report["off_market"]
     )
 
     css = """:root{--cream:#f6f3ea;--ink:#22281f;--moss-dim:#7c8f7a;--line:#dcd6c4;
