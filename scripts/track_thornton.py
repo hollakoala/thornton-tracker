@@ -12,7 +12,9 @@ in this repo. Reads/writes:
                                 one from scratch, to protect price history)
   data/price-history.csv       flat, git-diffable append log (one row per
                                 unit per run where the price is known)
-  docs/index.html              self-contained dashboard, served by GitHub Pages
+  docs/index.html               self-contained dashboard, served by GitHub Pages -
+                                each unit card includes a price-history sparkline
+                                built from price-history.csv
 
 Constraints preserved from the original routine:
   - Creekside = any unit NOT in Building 2 or 3 (defined by exclusion)
@@ -149,6 +151,29 @@ def last_recorded_price(ws, row, last_date_col):
     return None, None
 
 
+def compose_specs(site):
+    """Build a 'Studio, 1 bath' / '2 bed, 1.5 bath' string for a freshly
+    scraped unit, matching the format already used in the Specs column."""
+    beds = site.get("beds")
+    bath = site.get("bath")
+    parts = []
+    if beds:
+        parts.append("Studio" if str(beds).lower() == "studio" else f"{beds} bed")
+    if bath:
+        parts.append(f"{bath} bath")
+    return ", ".join(parts)
+
+
+def read_row_specs(ws, row):
+    return {
+        "location": ws.cell(row=row, column=3).value,
+        "specs": ws.cell(row=row, column=4).value,
+        "sqft": ws.cell(row=row, column=5).value,
+        "layout": ws.cell(row=row, column=6).value,
+        "avail": ws.cell(row=row, column=7).value,
+    }
+
+
 def update_tracker_and_history(wb, scraped):
     ws = wb.active  # Overview sheet
     today = datetime.now()
@@ -177,6 +202,7 @@ def update_tracker_and_history(wb, scraped):
     scraped_by_unit = {u["unit"]: u for u in scraped}
 
     price_changes, new_listings, off_market, spec_flags, unchanged = [], [], [], [], []
+    active_units = []  # full display info (specs/sqft/price/etc.) for the dashboard
 
     # Insert a new date column before "$ Change"
     new_col = change_col
@@ -198,10 +224,11 @@ def update_tracker_and_history(wb, scraped):
     for unit, row in tracker_by_unit.items():
         last_price, _ = last_recorded_price(ws, row, last_date_col)
         site = scraped_by_unit.get(unit)
+        specs = read_row_specs(ws, row)
 
         if site is None:
             ws.cell(row=row, column=8).value = "Off Market"  # Notes column H
-            off_market.append((unit, last_price))
+            off_market.append((unit, last_price, specs))
             continue
 
         try:
@@ -213,9 +240,16 @@ def update_tracker_and_history(wb, scraped):
             if last_price is None or abs(current - last_price) > 0.005:
                 ws.cell(row=row, column=new_col).value = current
                 price_changes.append((unit, last_price, current))
+                if last_price is None:
+                    status = "flat"  # first price ever recorded - nothing to compare against
+                else:
+                    status = "drop" if current < last_price else "rise"
             else:
                 unchanged.append(unit)
+                status = "flat"
             csv_rows.append([today.strftime("%Y-%m-%d"), unit, current])
+            active_units.append({"unit": unit, "price": current, "old_price": last_price,
+                                  "status": status, **specs})
 
         # spec sanity check only - never auto-write D/E/F
         beds = ws.cell(row=row, column=4).value
@@ -231,7 +265,8 @@ def update_tracker_and_history(wb, scraped):
         ws.insert_rows(new_row)
         ws.cell(row=new_row, column=1).value = f"#{unit}"
         ws.cell(row=new_row, column=2).value = "\u2705"
-        ws.cell(row=new_row, column=4).value = site.get("beds", "")
+        specs_text = compose_specs(site)
+        ws.cell(row=new_row, column=4).value = specs_text
         ws.cell(row=new_row, column=5).value = site.get("sqft", "")
         ws.cell(row=new_row, column=6).value = site.get("layout", "")
         ws.cell(row=new_row, column=7).value = site.get("avail", "")
@@ -244,6 +279,11 @@ def update_tracker_and_history(wb, scraped):
             csv_rows.append([today.strftime("%Y-%m-%d"), unit, current])
         new_listings.append((unit, current, site))
         active_rows.append(new_row)
+        active_units.append({
+            "unit": unit, "price": current, "old_price": None, "status": "new",
+            "location": None, "specs": specs_text, "sqft": site.get("sqft"),
+            "layout": site.get("layout"), "avail": site.get("avail"),
+        })
 
     # Append to CSV price history (git-diffable, append-only)
     is_new_csv = not CSV_PATH.exists()
@@ -259,6 +299,7 @@ def update_tracker_and_history(wb, scraped):
         "off_market": off_market,
         "spec_flags": spec_flags,
         "unchanged": unchanged,
+        "active_units": active_units,
     }
 
 
@@ -275,82 +316,290 @@ def recalc_workbook():
               f"they just need Excel/LibreOffice to open once to refresh cached values.")
 
 
-def build_html(report, as_of):
-    active = [u for u in report["price_changes"]] + [u for u in report["unchanged"]]
-    n_drops = sum(1 for _, old, new in report["price_changes"] if old is not None and new < old)
-    n_new = len(report["new_listings"])
-    n_active = len(report["price_changes"]) + len(report["unchanged"])
+STATUS_PRIORITY = {"new": 0, "drop": 1, "rise": 2, "flat": 3}
+ARROW_DOWN = "\u25bc"
+ARROW_UP = "\u25b2"
+EM_DASH = "\u2014"
+MIDDOT = "\u00b7"
 
-    rows_html = ""
-    for unit, old, new in report["price_changes"]:
-        if old is None:
-            change_txt, direction = "new", "flat"
-        else:
-            delta = new - old
-            pct = (delta / old * 100) if old else 0
-            direction = "drop" if delta < 0 else ("rise" if delta > 0 else "flat")
-            arrow = "\u25bc" if delta < 0 else ("\u25b2" if delta > 0 else "\u2014")
-            change_txt = f"{arrow} ${abs(delta):,.0f} ({pct:+.1f}%)"
-        rows_html += (
-            f'<div class="card"><div class="card-body"><div class="top">'
-            f'<span class="unit">#{unit}</span></div>'
-            f'<div class="price">${new:,.0f}</div>'
-            f'<div class="change {direction}">{change_txt}</div></div></div>'
-        )
-    for unit in report["unchanged"]:
-        rows_html += (
-            f'<div class="card"><div class="card-body"><div class="top">'
-            f'<span class="unit">#{unit}</span></div>'
-            f'<div class="change flat">no change</div></div></div>'
-        )
-
-    em_dash = "\u2014"
-    archive_html = "".join(
-        f'<div class="archive-row"><span>#{unit}</span>'
-        f'<span class="p">{f"${price:,.0f}" if price else em_dash}</span></div>'
-        for unit, price in report["off_market"]
-    )
-
-    css = """:root{--cream:#f6f3ea;--ink:#22281f;--moss-dim:#7c8f7a;--line:#dcd6c4;
---card:#fffefa;--drop:#2f6b4f;--rise:#a8472f;--flat:#9b9685}
+BASE_CSS = """:root{--cream:#f6f3ea;--ink:#22281f;--moss-dim:#7c8f7a;--line:#dcd6c4;
+--card:#fffefa;--drop:#2f6b4f;--rise:#a8472f;--flat:#9b9685;--accent:#7c8f7a}
+@media (prefers-color-scheme:dark){:root{--cream:#1b1d18;--ink:#eae7da;--moss-dim:#9aa38f;
+--line:#33362c;--card:#242720;--drop:#5fbf8f;--rise:#e08668;--flat:#7c8069;--accent:#5fbf8f}}
 *{box-sizing:border-box}body{margin:0;background:var(--cream);color:var(--ink);
 font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;line-height:1.4}
-.wrap{max-width:980px;margin:0 auto;padding:32px 20px 80px}
+.wrap{max-width:1040px;margin:0 auto;padding:32px 20px 80px}
 header h1{font-family:Georgia,serif;font-size:34px;margin:0 0 2px}
 header p{margin:0;color:var(--moss-dim);font-size:13px}
 .stats{display:flex;gap:18px;flex-wrap:wrap;margin:22px 0 26px}
 .stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 16px;min-width:120px}
 .stat .n{font-family:ui-monospace,Menlo,monospace;font-size:20px;font-weight:600}
 .stat .l{font-size:11px;color:var(--moss-dim);text-transform:uppercase;letter-spacing:.04em}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--line);border-radius:12px}
+.card-new{border-left-color:var(--accent)}.card-drop{border-left-color:var(--drop)}
+.card-rise{border-left-color:var(--rise)}
 .card-body{padding:14px 16px 16px}
-.top{display:flex;justify-content:space-between;align-items:baseline}
+.top{display:flex;justify-content:space-between;align-items:center;gap:8px}
 .unit{font-weight:700;font-size:16px}
-.price{font-family:ui-monospace,Menlo,monospace;font-size:24px;font-weight:600}
-.change{font-size:12.5px;font-weight:600;margin-top:2px}
-.drop{color:var(--drop)}.rise{color:var(--rise)}.flat{color:var(--flat)}
+.layout{margin-left:auto;font-size:11px;color:var(--moss-dim);border:1px solid var(--line);
+border-radius:6px;padding:1px 6px}
+.badge-new{font-size:10px;font-weight:700;letter-spacing:.04em;color:var(--card);
+background:var(--accent);border-radius:6px;padding:2px 6px}
+.specs{font-size:13px;color:var(--moss-dim);margin-top:6px}
+.location{font-size:12px;color:var(--moss-dim);margin-top:2px}
+.avail{font-size:12px;color:var(--moss-dim);margin-top:2px}
+.price{font-family:ui-monospace,Menlo,monospace;font-size:24px;font-weight:600;margin-top:10px}
+.price-na{color:var(--moss-dim);font-size:18px}
+.persqft{font-size:11.5px;color:var(--moss-dim);margin-top:1px}
+.change{font-size:12.5px;font-weight:600;margin-top:6px}
+.drop{color:var(--drop)}.rise{color:var(--rise)}.flat{color:var(--flat)}.new{color:var(--accent)}
 h2.section{font-family:Georgia,serif;font-size:18px;color:var(--moss-dim);margin:34px 0 12px;font-weight:normal}
-.archive-row{display:flex;justify-content:space-between;background:var(--card);
+.archive-row{display:flex;justify-content:space-between;align-items:center;gap:12px;background:var(--card);
 border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-bottom:8px;font-size:13.5px}
-.p{font-family:ui-monospace,Menlo,monospace;color:var(--moss-dim)}"""
+.au{flex:0 0 auto;font-weight:600}
+.archive-specs{flex:1 1 auto;color:var(--moss-dim);font-size:12.5px;text-align:right;margin-right:8px}
+.p{font-family:ui-monospace,Menlo,monospace;color:var(--moss-dim);flex:0 0 auto}
+.empty{color:var(--moss-dim);font-size:13.5px;padding:20px 0}
+.spark-wrap{margin-top:10px}
+.sparkline{width:100%;height:auto;display:block}
+.spark-line{stroke:var(--moss-dim);stroke-width:2;stroke-linecap:round;stroke-linejoin:round;opacity:.6}
+.spark-dot-hist{fill:var(--card);stroke:var(--moss-dim);stroke-width:1.5;opacity:.6}
+.spark-dot-drop{fill:var(--drop);stroke:var(--card);stroke-width:2}
+.spark-dot-rise{fill:var(--rise);stroke:var(--card);stroke-width:2}
+.spark-dot-flat{fill:var(--flat);stroke:var(--card);stroke-width:2}
+.spark-dot-new{fill:var(--accent);stroke:var(--card);stroke-width:2}
+.spark-hit{fill:transparent;cursor:default}
+.spark-hit:hover,.spark-hit:focus{fill:var(--ink);opacity:.08;outline:none}
+.no-history{color:var(--moss-dim);font-size:12px;font-style:italic;margin-top:10px}
+.chart-tooltip{position:fixed;transform:translate(-50%,-100%);background:var(--ink);color:var(--cream);
+font-size:12px;font-family:ui-monospace,Menlo,monospace;font-weight:600;padding:5px 9px;border-radius:6px;
+pointer-events:none;opacity:0;transition:opacity .1s ease;z-index:1000;white-space:nowrap}
+.chart-tooltip.visible{opacity:1}"""
+
+TOOLTIP_JS = """
+(function(){
+  var tip = document.getElementById('chart-tooltip');
+  if (!tip) return;
+  function show(el){
+    var date = el.getAttribute('data-date'), price = el.getAttribute('data-price');
+    if (!date || !price) return;
+    tip.textContent = date + ': ' + price;
+    var r = el.getBoundingClientRect();
+    tip.style.left = (r.left + r.width / 2) + 'px';
+    tip.style.top = (r.top - 6) + 'px';
+    tip.classList.add('visible');
+  }
+  function hide(){ tip.classList.remove('visible'); }
+  document.addEventListener('pointerover', function(e){
+    var el = e.target.closest && e.target.closest('.spark-hit');
+    if (el) show(el);
+  });
+  document.addEventListener('pointerout', function(e){
+    var el = e.target.closest && e.target.closest('.spark-hit');
+    if (el) hide();
+  });
+  document.addEventListener('focusin', function(e){
+    var el = e.target.closest && e.target.closest('.spark-hit');
+    if (el) show(el);
+  });
+  document.addEventListener('focusout', function(e){
+    var el = e.target.closest && e.target.closest('.spark-hit');
+    if (el) hide();
+  });
+})();
+"""
+
+
+def read_price_history():
+    """Parses data/price-history.csv into {unit: [(date, price), ...]} sorted
+    chronologically. Returns {} if the file doesn't exist yet (first-ever run)."""
+    by_unit = {}
+    if not CSV_PATH.exists():
+        return by_unit
+    with open(CSV_PATH, newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                price = float(row["total_price"])
+            except (KeyError, ValueError):
+                continue
+            by_unit.setdefault(row["unit"], []).append((row["date"], price))
+    for series in by_unit.values():
+        series.sort(key=lambda p: p[0])
+    return by_unit
+
+
+def render_card(u, series):
+    """One dashboard tile for an active unit: unit #, layout, specs, sqft,
+    availability, price, $/sqft, today's change vs. yesterday, and a price
+    history sparkline (series: [(date, price), ...] for this unit, oldest first)."""
+    layout_badge = f'<span class="layout">{u["layout"]}</span>' if u.get("layout") else ""
+    badge = '<span class="badge-new">NEW</span>' if u["status"] == "new" else ""
+
+    spec_bits = []
+    if u.get("specs"):
+        spec_bits.append(str(u["specs"]))
+    if u.get("sqft"):
+        spec_bits.append(f"{u['sqft']} sq ft")
+    specs_line = f' {MIDDOT} '.join(spec_bits)
+    location_line = f'<div class="location">{u["location"]}</div>' if u.get("location") else ""
+    avail_line = ""
+    if u.get("avail"):
+        avail_text = str(u["avail"])
+        prefix = "" if avail_text.lower().startswith("available") else "Available "
+        avail_line = f'<div class="avail">{prefix}{avail_text}</div>'
+
+    price = u.get("price")
+    if price is None:
+        price_html = f'<div class="price price-na">{EM_DASH}</div>'
+        per_sqft_html = ""
+    else:
+        price_html = f'<div class="price">${price:,.0f}</div>'
+        per_sqft_html = ""
+        if u.get("sqft"):
+            try:
+                per_sqft = price / float(str(u["sqft"]).replace(",", ""))
+                per_sqft_html = f'<div class="persqft">${per_sqft:.2f}/sq ft</div>'
+            except (ValueError, ZeroDivisionError):
+                pass
+
+    status = u["status"]
+    old = u.get("old_price")
+    if status == "new":
+        change_txt = "new listing"
+    elif status == "flat":
+        change_txt = "no change"
+    else:
+        delta = price - old
+        pct = (delta / old * 100) if old else 0
+        arrow = ARROW_DOWN if delta < 0 else ARROW_UP
+        change_txt = f"{arrow} ${abs(delta):,.0f} ({pct:+.1f}%)"
+
+    return (
+        f'<div class="card card-{status}"><div class="card-body">'
+        f'<div class="top"><span class="unit">#{u["unit"]}</span>{layout_badge}{badge}</div>'
+        f'<div class="specs">{specs_line}</div>'
+        f'{location_line}{avail_line}'
+        f'{price_html}{per_sqft_html}'
+        f'<div class="change {status}">{change_txt}</div>'
+        f'<div class="spark-wrap">{render_sparkline(series, status=status)}</div>'
+        '</div></div>'
+    )
+
+
+def render_archive_row(unit, price, specs):
+    price_txt = f"${price:,.0f}" if price else EM_DASH
+    spec_bits = []
+    if specs.get("specs"):
+        spec_bits.append(str(specs["specs"]))
+    if specs.get("sqft"):
+        spec_bits.append(f"{specs['sqft']} sq ft")
+    spec_txt = f' {MIDDOT} '.join(spec_bits)
+    return (
+        f'<div class="archive-row"><span class="au">#{unit}</span>'
+        f'<span class="archive-specs">{spec_txt}</span>'
+        f'<span class="p">{price_txt}</span></div>'
+    )
+
+
+def build_html(report, as_of):
+    active_units = sorted(
+        report["active_units"],
+        key=lambda u: (STATUS_PRIORITY.get(u["status"], 9), u["unit"]),
+    )
+    n_drops = sum(1 for u in active_units if u["status"] == "drop")
+    n_new = len(report["new_listings"])
+    n_active = len(active_units)
+    priced = [u["price"] for u in active_units if u.get("price") is not None]
+    avg_price = sum(priced) / len(priced) if priced else None
+
+    price_history = read_price_history()
+    rows_html = "".join(render_card(u, price_history.get(u["unit"], [])) for u in active_units)
+    archive_html = "".join(render_archive_row(unit, price, specs) for unit, price, specs in report["off_market"])
+
+    avg_stat = (
+        f'<div class="stat"><div class="n">${avg_price:,.0f}</div><div class="l">Avg. price</div></div>'
+        if avg_price is not None else ""
+    )
 
     html = (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        '<title>Creekside Watch</title><style>' + css + '</style></head><body><div class="wrap">'
+        '<link rel="icon" href="data:,%F0%9F%8F%A2">'
+        '<title>Creekside Watch</title><style>' + BASE_CSS + '</style></head><body><div class="wrap">'
         '<header><h1>Creekside Watch</h1>'
-        f'<p>Thornton Place \u00b7 Creekside = any unit not in Building 2 or 3 \u00b7 Data as of {as_of}</p></header>'
+        f'<p>Thornton Place {MIDDOT} Creekside = any unit not in Building 2 or 3 {MIDDOT} Data as of {as_of}</p></header>'
         '<div class="stats">'
         f'<div class="stat"><div class="n">{n_active}</div><div class="l">Active units</div></div>'
         f'<div class="stat"><div class="n">{n_drops}</div><div class="l">Price drops today</div></div>'
-        f'<div class="stat"><div class="n">{n_new}</div><div class="l">New today</div></div></div>'
-        f'<div class="grid">{rows_html}</div>'
+        f'<div class="stat"><div class="n">{n_new}</div><div class="l">New today</div></div>'
+        f'{avg_stat}</div>'
+        + (f'<div class="grid">{rows_html}</div>' if rows_html else '<div class="empty">No active Creekside units right now.</div>')
         + (f'<h2 class="section">Off market</h2>{archive_html}' if archive_html else '')
-        + '</div></body></html>'
+        + '</div><div id="chart-tooltip" class="chart-tooltip" role="tooltip"></div>'
+        + '<script>' + TOOLTIP_JS + '</script></body></html>'
     )
     HTML_PATH.parent.mkdir(parents=True, exist_ok=True)
     HTML_PATH.write_text(html)
+
+
+def _fmt_axis_date(date_str):
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").strftime("%b %-d")
+    except ValueError:
+        return date_str
+
+
+def _svg_points(series, width, height, pad_l=4, pad_r=4, pad_t=10, pad_b=10):
+    """series: [(label, value), ...]. Single point is right-aligned so it sits
+    where a multi-point line's endpoint would; flat/constant series draw as a
+    flat line rather than dividing by zero."""
+    n = len(series)
+    if n == 0:
+        return []
+    values = [v for _, v in series]
+    lo, hi = min(values), max(values)
+    if hi - lo < 1e-9:
+        lo, hi = lo - 1, hi + 1
+    usable_w = width - pad_l - pad_r
+    usable_h = height - pad_t - pad_b
+    points = []
+    for i, (_, v) in enumerate(series):
+        x = pad_l + (usable_w if n == 1 else usable_w * i / (n - 1))
+        y = pad_t + usable_h * (1 - (v - lo) / (hi - lo))
+        points.append((x, y))
+    return points
+
+
+def render_sparkline(series, width=220, height=54, status="flat"):
+    """Compact per-unit trend: muted line, status-colored endpoint dot. Each
+    point gets an oversized transparent hit-circle on top (the visible dot is
+    only 5-8px, far too small to hover reliably) carrying data-date/data-price
+    attributes - a page-level script (see build_html) reads these and drives
+    a real tooltip, since native SVG <title> tooltips are unreliable across
+    browsers/trackpads."""
+    if not series:
+        return '<div class="no-history">No price history yet</div>'
+    points = _svg_points(series, width, height)
+    marks = []
+    if len(points) > 1:
+        path_d = "M " + " L ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+        marks.append(f'<path d="{path_d}" class="spark-line" fill="none"/>')
+    hit_areas = []
+    for i, ((date, price), (x, y)) in enumerate(zip(series, points)):
+        is_last = i == len(series) - 1
+        cls = f"spark-dot-{status}" if is_last else "spark-dot-hist"
+        r = 4 if is_last else 2.5
+        marks.append(f'<circle class="spark-dot {cls}" cx="{x:.1f}" cy="{y:.1f}" r="{r}"/>')
+        hit_areas.append(
+            f'<circle class="spark-hit" cx="{x:.1f}" cy="{y:.1f}" r="12" tabindex="0" '
+            f'data-date="{_fmt_axis_date(date)}" data-price="${price:,.0f}"/>'
+        )
+    marks.extend(hit_areas)  # hit-circles last so they sit on top and actually receive hover
+    return (
+        f'<svg class="sparkline" viewBox="0 0 {width} {height}" role="img" '
+        f'aria-label="Price trend, {len(series)} data point(s)">{"".join(marks)}</svg>'
+    )
 
 
 def main():
