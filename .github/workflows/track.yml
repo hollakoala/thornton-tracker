@@ -2,9 +2,12 @@ name: Track Thornton Place Creekside Prices
 
 on:
   schedule:
-    # Runs at 13:00 UTC daily = 5:00 AM Pacific (6:00 AM during PST)
-    # Adjust the hour if you want a different time of day.
-    - cron: '0 13 * * *'
+    # Runs at ~13:00 UTC daily = 5:00 AM Pacific (6:00 AM during PST)
+    # Off the top-of-hour minute on purpose: GitHub Actions scheduled runs
+    # queue at exact-hour minutes (0/15/30/45) and can be delayed or silently
+    # dropped under load. Adjust the hour if you want a different time of day,
+    # but keep the minute non-round.
+    - cron: '7 13 * * *'
   workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
 
 permissions:
