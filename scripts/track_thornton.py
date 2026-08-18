@@ -202,6 +202,7 @@ def update_tracker_and_history(wb, scraped):
     scraped_by_unit = {u["unit"]: u for u in scraped}
 
     price_changes, new_listings, off_market, spec_flags, unchanged = [], [], [], [], []
+    newly_off_market = []  # subset of off_market that JUST left (not already flagged from a prior run)
     active_units = []  # full display info (specs/sqft/price/etc.) for the dashboard
 
     # Insert a new date column before "$ Change"
@@ -227,8 +228,12 @@ def update_tracker_and_history(wb, scraped):
         specs = read_row_specs(ws, row)
 
         if site is None:
-            ws.cell(row=row, column=8).value = "Off Market"  # Notes column H
+            notes_cell = ws.cell(row=row, column=8)  # Notes column H
+            was_already_off = notes_cell.value == "Off Market"
+            notes_cell.value = "Off Market"
             off_market.append((unit, last_price, specs))
+            if not was_already_off:
+                newly_off_market.append((unit, last_price, specs))
             continue
 
         try:
@@ -297,6 +302,7 @@ def update_tracker_and_history(wb, scraped):
         "price_changes": price_changes,
         "new_listings": new_listings,
         "off_market": off_market,
+        "newly_off_market": newly_off_market,
         "spec_flags": spec_flags,
         "unchanged": unchanged,
         "active_units": active_units,
@@ -356,8 +362,12 @@ background:var(--accent);border-radius:6px;padding:2px 6px}
 .drop{color:var(--drop)}.rise{color:var(--rise)}.flat{color:var(--flat)}.new{color:var(--accent)}
 h2.section{font-family:Georgia,serif;font-size:18px;color:var(--moss-dim);margin:34px 0 12px;font-weight:normal}
 .archive-row{display:flex;justify-content:space-between;align-items:center;gap:12px;background:var(--card);
-border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-bottom:8px;font-size:13.5px}
+border:1px solid var(--line);border-left:3px solid var(--line);border-radius:10px;padding:10px 14px;
+margin-bottom:8px;font-size:13.5px}
+.archive-row-new{border-left-color:var(--rise);background:color-mix(in srgb, var(--rise) 7%, var(--card))}
 .au{flex:0 0 auto;font-weight:600}
+.badge-off{flex:0 0 auto;font-size:10px;font-weight:700;letter-spacing:.04em;color:var(--card);
+background:var(--rise);border-radius:6px;padding:2px 6px}
 .archive-specs{flex:1 1 auto;color:var(--moss-dim);font-size:12.5px;text-align:right;margin-right:8px}
 .p{font-family:ui-monospace,Menlo,monospace;color:var(--moss-dim);flex:0 0 auto}
 .empty{color:var(--moss-dim);font-size:13.5px;padding:20px 0}
@@ -487,7 +497,7 @@ def render_card(u, series):
     )
 
 
-def render_archive_row(unit, price, specs):
+def render_archive_row(unit, price, specs, is_new=False):
     price_txt = f"${price:,.0f}" if price else EM_DASH
     spec_bits = []
     if specs.get("specs"):
@@ -495,8 +505,10 @@ def render_archive_row(unit, price, specs):
     if specs.get("sqft"):
         spec_bits.append(f"{specs['sqft']} sq ft")
     spec_txt = f' {MIDDOT} '.join(spec_bits)
+    row_cls = "archive-row archive-row-new" if is_new else "archive-row"
+    badge = '<span class="badge-off">LEFT TODAY</span>' if is_new else ""
     return (
-        f'<div class="archive-row"><span class="au">#{unit}</span>'
+        f'<div class="{row_cls}"><span class="au">#{unit}</span>{badge}'
         f'<span class="archive-specs">{spec_txt}</span>'
         f'<span class="p">{price_txt}</span></div>'
     )
@@ -510,13 +522,26 @@ def build_html(report, as_of):
     n_drops = sum(1 for u in active_units if u["status"] == "drop")
     n_new = len(report["new_listings"])
     n_active = len(active_units)
+    n_off_today = len(report.get("newly_off_market", []))
     priced = [u["price"] for u in active_units if u.get("price") is not None]
     avg_price = sum(priced) / len(priced) if priced else None
 
     price_history = read_price_history()
     rows_html = "".join(render_card(u, price_history.get(u["unit"], [])) for u in active_units)
-    archive_html = "".join(render_archive_row(unit, price, specs) for unit, price, specs in report["off_market"])
 
+    newly_off_units = {unit for unit, _, _ in report.get("newly_off_market", [])}
+    archive_items = sorted(
+        report["off_market"],
+        key=lambda item: 0 if item[0] in newly_off_units else 1,
+    )
+    archive_html = "".join(
+        render_archive_row(unit, price, specs, is_new=(unit in newly_off_units))
+        for unit, price, specs in archive_items
+    )
+
+    off_today_stat = (
+        f'<div class="stat"><div class="n">{n_off_today}</div><div class="l">Off market today</div></div>'
+    )
     avg_stat = (
         f'<div class="stat"><div class="n">${avg_price:,.0f}</div><div class="l">Avg. price</div></div>'
         if avg_price is not None else ""
@@ -533,7 +558,7 @@ def build_html(report, as_of):
         f'<div class="stat"><div class="n">{n_active}</div><div class="l">Active units</div></div>'
         f'<div class="stat"><div class="n">{n_drops}</div><div class="l">Price drops today</div></div>'
         f'<div class="stat"><div class="n">{n_new}</div><div class="l">New today</div></div>'
-        f'{avg_stat}</div>'
+        f'{off_today_stat}{avg_stat}</div>'
         + (f'<div class="grid">{rows_html}</div>' if rows_html else '<div class="empty">No active Creekside units right now.</div>')
         + (f'<h2 class="section">Off market</h2>{archive_html}' if archive_html else '')
         + '</div><div id="chart-tooltip" class="chart-tooltip" role="tooltip"></div>'
