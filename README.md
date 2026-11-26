@@ -14,7 +14,9 @@ session needs to be on.
    from a branch > Branch: main, folder: /docs**.
 3. That's it. The workflow in `.github/workflows/track.yml` runs daily at
    13:00 UTC (5am Pacific) and will:
-   - scrape thornton-place.com for current Creekside listings
+   - pull current Creekside listings from the SightMap data feed behind the
+     floor plan widget (falls back to loading the embed in a headless browser,
+     then to scraping thornton-place.com if the feed is unreachable)
    - update `data/Thornton_Tracker.xlsx` (same formulas/layout as before)
    - append today's prices to `data/price-history.csv`
    - rebuild `docs/index.html` (your live dashboard)
@@ -35,5 +37,10 @@ session needs to be on.
   zero units - the script treats an empty scrape as a no-op (nothing
   written) rather than assuming every unit went off-market. Check the
   Actions log if the dashboard stops updating.
+- Units are only marked off market when the run got SightMap's full unit
+  list. If only the HTML fallback worked, units it didn't see are left as
+  they were and listed in the Actions log.
+- Each dashboard card carries a `data-beds` attribute (0 = studio) so a
+  watch can filter to 2BR+; the log also prints the active 2BR+ units.
 - Spec mismatches (sqft, etc.) are flagged in the Actions log, never
   auto-corrected in the tracker - same as the original routine.

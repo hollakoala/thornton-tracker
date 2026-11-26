@@ -25,6 +25,7 @@ Constraints preserved from the original routine:
 
 import csv
 import json
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -39,11 +40,194 @@ HTML_PATH = ROOT / "docs" / "index.html"
 
 SITE_URL = "https://thornton-place.com/floorplans/"
 
+# SightMap (Engrain) embed behind the floor plan widget. The data endpoint
+# returns every available unit in one JSON response, so it's the primary
+# source. If the token/id ever change, scrape_sightmap_browser() re-derives
+# them by watching the embed page's own network requests.
+SIGHTMAP_EMBED_URL = "https://sightmap.com/embed/z40vly07ple/?enable_api=1"
+SIGHTMAP_API_URL = "https://sightmap.com/app/api/v1/my8pxrqzp19/sightmaps/13954"
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/125.0.0.0 Safari/537.36")
 
-def scrape_units():
-    """Headless-Chromium scrape of the SightMap floor widget. Returns a
-    list of dicts, or [] if scraping failed / found nothing (caller must
-    treat that as a no-op, not as 'everything went off market')."""
+
+def is_creekside(unit_number):
+    """Creekside = any unit NOT in Building 2 or 3 (defined by exclusion)."""
+    return bool(unit_number) and not str(unit_number).startswith(("2-", "3-"))
+
+
+def parse_price(value):
+    """Accepts 2706.35, '2,706.35', '$2,706.35' or None -> float or None."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).replace("$", "").replace(",", "").strip())
+    except ValueError:
+        return None
+
+
+def _fmt_count(n):
+    """1 -> '1', 1.5 -> '1.5' (bath counts come back as floats)."""
+    if n is None:
+        return None
+    try:
+        f = float(n)
+    except (TypeError, ValueError):
+        return str(n)
+    return str(int(f)) if f.is_integer() else str(f)
+
+
+def _floor_label(floor):
+    for key in ("filter_short_label", "short_label", "label", "name"):
+        val = floor.get(key) if isinstance(floor, dict) else None
+        if val:
+            return str(val).replace("Floor", "").strip() or None
+    return None
+
+
+def parse_sightmap(payload):
+    """Turns the SightMap JSON into the scraper's unit dicts (ALL buildings).
+    Returns [] if the payload isn't shaped like we expect."""
+    data = (payload or {}).get("data") or {}
+    raw_units = data.get("units") or []
+    plans = {str(fp.get("id")): fp for fp in data.get("floor_plans") or []}
+    floors = {str(fl.get("id")): fl for fl in data.get("floors") or [] if isinstance(fl, dict)}
+
+    units = []
+    for u in raw_units:
+        number = u.get("unit_number") or u.get("label")
+        if not number:
+            continue
+        fp = plans.get(str(u.get("floor_plan_id")), {})
+        layout = fp.get("name")
+        if isinstance(layout, str) and layout.strip().startswith("{"):
+            try:
+                layout = json.loads(layout).get("name") or layout
+            except ValueError:
+                pass
+        layout = layout or fp.get("filter_label")
+
+        total = u.get("total_price")
+        if isinstance(total, list):
+            total = total[0] if total else None
+        if total is None:
+            total = u.get("total_display_price")
+
+        beds_count = fp.get("bedroom_count")
+        if beds_count is None:
+            beds = None
+        elif float(beds_count) == 0:
+            beds = "Studio"
+        else:
+            beds = _fmt_count(beds_count)
+
+        avail = u.get("display_available_on")
+        if isinstance(avail, str):
+            # "Available Dec 12th" -> "Dec 12", "Available Now" -> "Now" (the
+            # Available Date column's existing format)
+            if avail.lower().startswith("available "):
+                avail = avail[len("available "):]
+            avail = re.sub(r"(\d+)(st|nd|rd|th)\b", r"\1", avail).strip()
+
+        area = u.get("area")
+        units.append({
+            "unit": str(number).lstrip("#"),
+            "total": parse_price(total),
+            "base": parse_price(u.get("price")),
+            "avail": avail,
+            "beds": beds,
+            "bedrooms": int(float(beds_count)) if beds_count is not None else None,
+            "bath": _fmt_count(fp.get("bathroom_count")),
+            "sqft": _fmt_count(area) if area is not None else None,
+            "layout": layout,
+            "building": u.get("building"),
+            "floor": _floor_label(floors.get(str(u.get("floor_id")), {})),
+        })
+    return units
+
+
+def fetch_sightmap_api():
+    """Plain HTTPS GET of the SightMap data endpoint. No browser needed."""
+    import urllib.request
+    req = urllib.request.Request(SIGHTMAP_API_URL, headers={
+        "Accept": "application/json",
+        "User-Agent": BROWSER_UA,
+        "Referer": SIGHTMAP_EMBED_URL,
+        "Origin": "https://sightmap.com",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"::warning::SightMap API request failed: {e}")
+        return []
+    units = parse_sightmap(payload)
+    print(f"SightMap API: {len(units)} units (all buildings).")
+    return units
+
+
+def scrape_sightmap_browser():
+    """Loads the SightMap embed in headless Chromium and reads the JSON the
+    widget itself requests. Also covers the case where the API token/id in
+    SIGHTMAP_API_URL changed - whatever endpoint the embed calls is used."""
+    from playwright.sync_api import sync_playwright
+
+    pattern = re.compile(r"/app/api/v1/[^/]+/sightmaps/\d+/?(\?.*)?$")
+    captured = {}
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=[
+                "--use-gl=swiftshader",
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ])
+            page = browser.new_page(viewport={"width": 1440, "height": 900}, user_agent=BROWSER_UA)
+            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+            def on_response(resp):
+                if "json" not in captured and pattern.search(resp.url):
+                    try:
+                        captured["json"] = resp.json()
+                        captured["url"] = resp.url
+                    except Exception:
+                        pass
+
+            page.on("response", on_response)
+            page.goto(SIGHTMAP_EMBED_URL, wait_until="domcontentloaded", timeout=60000)
+            for _ in range(30):
+                if "json" in captured:
+                    break
+                page.wait_for_timeout(1000)
+            if "json" not in captured:
+                # Same-origin fetch from the embed tab as a last try
+                try:
+                    captured["json"] = page.evaluate(
+                        "u => fetch(u, {headers: {Accept: 'application/json'}}).then(r => r.json())",
+                        SIGHTMAP_API_URL)
+                    captured["url"] = SIGHTMAP_API_URL
+                except Exception as e:
+                    print(f"::warning::In-page SightMap fetch failed: {e}")
+            browser.close()
+    except Exception as e:
+        print(f"::warning::SightMap embed load failed: {e}")
+        return []
+    if "json" not in captured:
+        return []
+    if captured.get("url") and pattern.search(captured["url"]) and SIGHTMAP_API_URL not in captured["url"]:
+        print(f"::warning::SightMap endpoint changed - widget used {captured['url']}. "
+              f"Update SIGHTMAP_API_URL.")
+    units = parse_sightmap(captured["json"])
+    print(f"SightMap embed (browser): {len(units)} units (all buildings).")
+    return units
+
+
+def scrape_html():
+    """Fallback: headless-Chromium scrape of the floor widget on
+    thornton-place.com. Returns a list of dicts, or [] if scraping failed /
+    found nothing. Floor-by-floor clicking can miss units, so the caller
+    treats this source as possibly incomplete."""
     from playwright.sync_api import sync_playwright
 
     js = r"""
@@ -89,17 +273,19 @@ def scrape_units():
                     "--no-sandbox",
                 ],
             )
-            page = browser.new_page(
-                viewport={"width": 1440, "height": 900},
-                user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                             "AppleWebKit/537.36 (KHTML, like Gecko) "
-                             "Chrome/125.0.0.0 Safari/537.36"),
-            )
+            page = browser.new_page(viewport={"width": 1440, "height": 900}, user_agent=BROWSER_UA)
             # Hide the most common automation fingerprint
             page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-            page.goto(SITE_URL, wait_until="networkidle", timeout=45000)
-            page.wait_for_timeout(3500)
+            # "networkidle" never fires on this site from GitHub's runners (it
+            # timed out every day Nov 16-25), so wait for the DOM, then for
+            # the unit cards themselves.
+            page.goto(SITE_URL, wait_until="domcontentloaded", timeout=60000)
+            try:
+                page.wait_for_selector(".jd-fp-unit-card", timeout=30000)
+            except Exception:
+                pass
+            page.wait_for_timeout(2000)
             units = page.evaluate(js)
 
             if not units:
@@ -114,10 +300,30 @@ def scrape_units():
     except Exception as e:
         print(f"::warning::Scrape failed: {e}")
         return []
+    for u in units:
+        u["total"] = parse_price(u.get("total"))
+        if u.get("beds") and str(u["beds"]).lower() == "studio":
+            u["bedrooms"] = 0
+        elif u.get("beds"):
+            try:
+                u["bedrooms"] = int(u["beds"])
+            except ValueError:
+                pass
+    print(f"HTML scrape: {len(units)} units.")
+    return units
 
-    # Creekside = NOT building 2 or 3
-    creekside = [u for u in units if u.get("unit") and not u["unit"].startswith(("2-", "3-"))]
-    return creekside
+
+def scrape_units():
+    """Returns (creekside_units, complete). complete=True only when the data
+    came from SightMap's full unit list, which is the only case where a
+    tracked unit missing from the list is safe to call off market.
+    ([], False) means the scrape failed - the caller must treat it as a no-op."""
+    for source in (fetch_sightmap_api, scrape_sightmap_browser):
+        units = source()
+        if units:
+            return [u for u in units if is_creekside(u.get("unit"))], True
+    units = scrape_html()
+    return [u for u in units if is_creekside(u.get("unit"))], False
 
 
 def load_tracker():
@@ -157,8 +363,8 @@ def compose_specs(site):
     beds = site.get("beds")
     bath = site.get("bath")
     parts = []
-    if beds:
-        parts.append("Studio" if str(beds).lower() == "studio" else f"{beds} bed")
+    if beds is not None and beds != "":
+        parts.append("Studio" if str(beds).lower() in ("studio", "0") else f"{beds} bed")
     if bath:
         parts.append(f"{bath} bath")
     return ", ".join(parts)
@@ -174,7 +380,52 @@ def read_row_specs(ws, row):
     }
 
 
-def update_tracker_and_history(wb, scraped):
+def compose_location(site):
+    """'Building 9, Floor 3' (matches the existing Location column)."""
+    building = site.get("building")
+    if not building and site.get("unit"):
+        building = str(site["unit"]).split("-")[0]
+    if not building:
+        return None
+    floor = site.get("floor")
+    return f"Building {building}, Floor {floor}" if floor else f"Building {building}"
+
+
+def bedrooms_from_specs(specs_text):
+    """'Studio, 1 bath' -> 0, '2 bed, 2 bath' -> 2, anything else -> None."""
+    if not specs_text:
+        return None
+    text = str(specs_text).lower()
+    if "studio" in text:
+        return 0
+    m = re.search(r"(\d+)\s*bed", text)
+    return int(m.group(1)) if m else None
+
+
+def rebuild_change_formulas(ws, rows, change_col, first_date_col=10, baseline_col=9):
+    """$ Change / % Change for active rows: latest recorded price vs the Feb
+    baseline in column I. Rows with no baseline show a literal em dash.
+    Uses LOOKUP(2,1/ISNUMBER(range),range) for "last number in the row" -
+    a nested IF per date column (the old pattern) breaks Excel's 64-level
+    nesting limit now that there are 100+ date columns."""
+    from openpyxl.utils import get_column_letter
+    first = get_column_letter(first_date_col)
+    last = get_column_letter(change_col - 1)
+    base = get_column_letter(baseline_col)
+    for r in rows:
+        dollar = ws.cell(row=r, column=change_col)
+        pct = ws.cell(row=r, column=change_col + 1)
+        if not isinstance(ws.cell(row=r, column=baseline_col).value, (int, float)):
+            dollar.value = EM_DASH
+            pct.value = EM_DASH
+            continue
+        latest = f"LOOKUP(2,1/ISNUMBER({first}{r}:{last}{r}),{first}{r}:{last}{r})"
+        dollar.value = f'=IFERROR({latest}-{base}{r},CHAR(8212))'
+        pct.value = f'=IFERROR(({latest}-{base}{r})/{base}{r},CHAR(8212))'
+        pct.number_format = "0.00%"
+
+
+def update_tracker_and_history(wb, scraped, complete=True):
     ws = wb.active  # Overview sheet
     today = datetime.now()
     active_rows = find_active_rows(ws)
@@ -202,6 +453,7 @@ def update_tracker_and_history(wb, scraped):
     scraped_by_unit = {u["unit"]: u for u in scraped}
 
     price_changes, new_listings, off_market, spec_flags, unchanged = [], [], [], [], []
+    relisted, unconfirmed = [], []
     newly_off_market = []  # subset of off_market that JUST left (not already flagged from a prior run)
     active_units = []  # full display info (specs/sqft/price/etc.) for the dashboard
 
@@ -227,8 +479,20 @@ def update_tracker_and_history(wb, scraped):
         site = scraped_by_unit.get(unit)
         specs = read_row_specs(ws, row)
 
+        notes_cell = ws.cell(row=row, column=8)  # Notes column H
         if site is None:
-            notes_cell = ws.cell(row=row, column=8)  # Notes column H
+            if not complete:
+                # Partial (fallback) scrape: a missing unit may just have been
+                # missed. Leave it as it was rather than calling it off market.
+                if notes_cell.value == "Off Market":
+                    off_market.append((unit, last_price, specs))
+                else:
+                    unconfirmed.append(unit)
+                    active_units.append({"unit": unit, "price": last_price, "old_price": last_price,
+                                         "status": "flat",
+                                         "bedrooms": bedrooms_from_specs(specs.get("specs")),
+                                         **specs})
+                continue
             was_already_off = notes_cell.value == "Off Market"
             notes_cell.value = "Off Market"
             off_market.append((unit, last_price, specs))
@@ -236,10 +500,18 @@ def update_tracker_and_history(wb, scraped):
                 newly_off_market.append((unit, last_price, specs))
             continue
 
-        try:
-            current = float(site["total"].replace(",", "")) if site.get("total") else None
-        except (ValueError, AttributeError):
-            current = None
+        if notes_cell.value == "Off Market":
+            notes_cell.value = None  # listed again
+            relisted.append(unit)
+
+        # Fill spec cells that are still blank (never overwrite what's there)
+        for col, value in ((3, compose_location(site)), (4, compose_specs(site)),
+                           (5, site.get("sqft")), (6, site.get("layout"))):
+            if value and ws.cell(row=row, column=col).value in (None, ""):
+                ws.cell(row=row, column=col).value = value
+        specs = read_row_specs(ws, row)
+
+        current = parse_price(site.get("total"))
 
         if current is not None:
             if last_price is None or abs(current - last_price) > 0.005:
@@ -253,8 +525,14 @@ def update_tracker_and_history(wb, scraped):
                 unchanged.append(unit)
                 status = "flat"
             csv_rows.append([today.strftime("%Y-%m-%d"), unit, current])
+            bedrooms = site.get("bedrooms")
+            if bedrooms is None:
+                bedrooms = bedrooms_from_specs(specs.get("specs"))
+            display_specs = dict(specs)
+            if bedrooms_from_specs(specs.get("specs")) is None and compose_specs(site):
+                display_specs["specs"] = compose_specs(site)  # dashboard only, tracker cell untouched
             active_units.append({"unit": unit, "price": current, "old_price": last_price,
-                                  "status": status, **specs})
+                                  "status": status, "bedrooms": bedrooms, **display_specs})
 
         # spec sanity check only - never auto-write D/E/F
         beds = ws.cell(row=row, column=4).value
@@ -270,15 +548,18 @@ def update_tracker_and_history(wb, scraped):
         ws.insert_rows(new_row)
         ws.cell(row=new_row, column=1).value = f"#{unit}"
         ws.cell(row=new_row, column=2).value = "\u2705"
+        ws.cell(row=new_row, column=3).value = compose_location(site)
         specs_text = compose_specs(site)
         ws.cell(row=new_row, column=4).value = specs_text
-        ws.cell(row=new_row, column=5).value = site.get("sqft", "")
+        sqft = site.get("sqft", "")
+        try:
+            sqft = int(float(str(sqft).replace(",", ""))) if sqft not in (None, "") else ""
+        except ValueError:
+            pass
+        ws.cell(row=new_row, column=5).value = sqft
         ws.cell(row=new_row, column=6).value = site.get("layout", "")
         ws.cell(row=new_row, column=7).value = site.get("avail", "")
-        try:
-            current = float(site["total"].replace(",", "")) if site.get("total") else None
-        except (ValueError, AttributeError):
-            current = None
+        current = parse_price(site.get("total"))
         if current is not None:
             ws.cell(row=new_row, column=new_col).value = current
             csv_rows.append([today.strftime("%Y-%m-%d"), unit, current])
@@ -286,9 +567,12 @@ def update_tracker_and_history(wb, scraped):
         active_rows.append(new_row)
         active_units.append({
             "unit": unit, "price": current, "old_price": None, "status": "new",
-            "location": None, "specs": specs_text, "sqft": site.get("sqft"),
+            "bedrooms": site.get("bedrooms"),
+            "location": compose_location(site), "specs": specs_text, "sqft": site.get("sqft"),
             "layout": site.get("layout"), "avail": site.get("avail"),
         })
+
+    rebuild_change_formulas(ws, active_rows, change_col)
 
     # Append to CSV price history (git-diffable, append-only)
     is_new_csv = not CSV_PATH.exists()
@@ -305,18 +589,33 @@ def update_tracker_and_history(wb, scraped):
         "newly_off_market": newly_off_market,
         "spec_flags": spec_flags,
         "unchanged": unchanged,
+        "relisted": relisted,
+        "unconfirmed": unconfirmed,
         "active_units": active_units,
     }
 
 
 def recalc_workbook():
-    """Recalculate cached formula values via headless LibreOffice, if available."""
+    """Recalculate cached formula values via headless LibreOffice, if available.
+    LibreOffice can't convert a file onto itself (it exits 0 but writes
+    nothing), so convert into a temp dir and move the result back."""
+    import shutil
+    import tempfile
     try:
-        subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "xlsx", "--outdir",
-             str(XLSX_PATH.parent), str(XLSX_PATH)],
-            check=True, timeout=90, capture_output=True,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(
+                ["libreoffice", "--headless", "--convert-to", "xlsx", "--outdir",
+                 tmp, str(XLSX_PATH)],
+                check=True, timeout=120, capture_output=True,
+            )
+            out = Path(tmp) / XLSX_PATH.name
+            if not out.exists():
+                raise RuntimeError("LibreOffice produced no output file")
+            # Sanity check before replacing the canonical workbook
+            check = load_workbook(out)
+            if check.active.max_row < 2 or check.active.cell(row=1, column=1).value != "Unit #":
+                raise RuntimeError("recalculated workbook looks wrong; keeping the openpyxl save")
+            shutil.move(str(out), str(XLSX_PATH))
     except Exception as e:
         print(f"::warning::Recalc skipped ({e}). Formulas are still correct, "
               f"they just need Excel/LibreOffice to open once to refresh cached values.")
@@ -473,6 +772,8 @@ def render_card(u, series):
             except (ValueError, ZeroDivisionError):
                 pass
 
+    beds_attr = f' data-beds="{u["bedrooms"]}"' if u.get("bedrooms") is not None else ""
+
     status = u["status"]
     old = u.get("old_price")
     if status == "new":
@@ -486,7 +787,7 @@ def render_card(u, series):
         change_txt = f"{arrow} ${abs(delta):,.0f} ({pct:+.1f}%)"
 
     return (
-        f'<div class="card card-{status}"><div class="card-body">'
+        f'<div class="card card-{status}"{beds_attr}><div class="card-body">'
         f'<div class="top"><span class="unit">#{u["unit"]}</span>{layout_badge}{badge}</div>'
         f'<div class="specs">{specs_line}</div>'
         f'{location_line}{avail_line}'
@@ -628,14 +929,17 @@ def render_sparkline(series, width=220, height=54, status="flat"):
 
 
 def main():
-    scraped = scrape_units()
+    scraped, complete = scrape_units()
     if not scraped:
         print("No units scraped (site may have blocked headless traffic, or genuinely nothing "
               "available). Treating as a no-op - nothing written.")
         return
 
     wb = load_tracker()
-    report = update_tracker_and_history(wb, scraped)
+    if not complete:
+        print("::warning::SightMap data unavailable - used the HTML fallback. Units missing from "
+              "it are left as they were, not marked off market.")
+    report = update_tracker_and_history(wb, scraped, complete=complete)
     wb.save(XLSX_PATH)
     recalc_workbook()
 
@@ -644,7 +948,12 @@ def main():
 
     print(f"Price changes: {len(report['price_changes'])}")
     print(f"New listings: {len(report['new_listings'])}")
-    print(f"Off market: {len(report['off_market'])}")
+    print(f"Off market: {len(report['off_market'])} ({len(report['newly_off_market'])} new today)")
+    print(f"Relisted: {len(report['relisted'])}")
+    if report["unconfirmed"]:
+        print(f"Not seen in fallback scrape, left as-is: {', '.join(report['unconfirmed'])}")
+    two_plus = [u["unit"] for u in report["active_units"] if (u.get("bedrooms") or 0) >= 2]
+    print(f"Active 2BR+ Creekside units: {', '.join(two_plus) if two_plus else 'none'}")
     print(f"Spec mismatches flagged: {len(report['spec_flags'])}")
     for unit, field, tracker_val, site_val in report["spec_flags"]:
         print(f"  ::warning:: #{unit} {field} mismatch - tracker={tracker_val} site={site_val}")
