@@ -159,7 +159,11 @@ def fetch_sightmap_api():
     })
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+            body = resp.read()
+        if body[:2] == b"\x1f\x8b":  # SightMap gzips even when not asked to
+            import gzip
+            body = gzip.decompress(body)
+        payload = json.loads(body.decode("utf-8"))
     except Exception as e:
         print(f"::warning::SightMap API request failed: {e}")
         return []
